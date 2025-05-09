@@ -5,6 +5,8 @@
 #include "tbfglobal.hpp"
 #include <complex>
 
+#include <starpu_mpi.h>
+#include <starpu_mpi_ms.h>
 #include "FMemUtils.hpp"
 #include "FSmartPointer.hpp"
 #include "FSpherical.hpp"
@@ -26,6 +28,112 @@ template <int N> struct NumberOfValuesInDlmk {
 template <> struct NumberOfValuesInDlmk<0> {
   enum { Value = 1 };
 };
+
+enum FMMFunctionIDs {
+    STARPU_MS_P2M_FUNC = 0,
+    STARPU_MS_M2M_FUNC,
+    STARPU_MS_M2L_FUNC,
+    STARPU_MS_L2L_FUNC,
+    STARPU_MS_L2P_FUNC,
+    STARPU_MS_P2P_FUNC,
+    STARPU_MS_P2P_TSM_FUNC,
+    STARPU_MS_P2P_INNER_FUNC
+};
+
+// Argument structures for all FMM operations
+template <class RealType_T, int P, class SpaceIndexType_T>
+class FRotationKernelArgs {
+public:
+    // P2M Args
+    template <class CellSymbolicData, class ParticlesClass, class LeafClass>
+    struct P2MArgs {
+        FRotationKernel<RealType_T, P, SpaceIndexType_T>* kernel;
+        CellSymbolicData leafIndex;
+        long int particlesIndexes[1];  // Dynamic size in reality
+        ParticlesClass sourceParticles;
+        unsigned long long nbParticles;
+        LeafClass* leafCell;
+    };
+
+    // M2M Args
+    template <class CellSymbolicData, class CellClassContainer, class CellClass>
+    struct M2MArgs {
+        FRotationKernel<RealType_T, P, SpaceIndexType_T>* kernel;
+        CellSymbolicData parentIndex;
+        long int level;
+        CellClassContainer* lowerCells;
+        CellClass* upperCell;
+        long int childrenPos[8];  // Maximum 8 children in octree
+        long int nbChildren;
+    };
+
+    // M2L Args
+    template <class CellSymbolicData, class CellClassContainer, class CellClass>
+    struct M2LArgs {
+        FRotationKernel<RealType_T, P, SpaceIndexType_T>* kernel;
+        CellSymbolicData targetIndex;
+        long int level;
+        CellClassContainer* interactingCells;
+        long int neighPos[343];  // Max number of interactions (7³)
+        long int nbNeighbors;
+        CellClass* outCell;
+    };
+
+    // L2L Args
+    template <class CellSymbolicData, class CellClass, class CellClassContainer>
+    struct L2LArgs {
+        FRotationKernel<RealType_T, P, SpaceIndexType_T>* kernel;
+        CellSymbolicData parentIndex;
+        long int level;
+        const CellClass* upperCell;
+ FMMFunctionIDs       CellClassContainer* lowerCells;
+        long int childrenPos[8];  // Maximum 8 children in octree
+        long int nbChildren;
+    };
+
+    // L2P Args
+    template <class CellSymbolicData, class LeafClass, class ParticlesClass, class ParticlesClassRhs>
+    struct L2PArgs {
+        FRotationKernel<RealType_T, P, SpaceIndexType_T>* kernel;
+        CellSymbolicData leafIndex;
+        LeafClass* leafCell;
+        long int particlesIndexes[1];  // Dynamic size in reality
+        ParticlesClass* particles;
+        ParticlesClassRhs* particlesRhs;
+        long int nbParticles;
+    };
+
+    // P2P Args
+    template <class LeafSymbolicData, class ParticlesClassValues, class ParticlesClassRhs>
+    struct P2PArgs {
+        FRotationKernel<RealType_T, P, SpaceIndexType_T>* kernel;
+        LeafSymbolicData neighborIndex;
+        long int neighborsIndexes[1];  // Dynamic size in reality
+        ParticlesClassValues* neighbors;
+        ParticlesClassRhs* neighborsRhs;
+        long int nbParticlesNeighbors;
+        LeafSymbolicData targetIndex;
+        long int targetIndexes[1];  // Dynamic size in reality
+        ParticlesClassValues* targets;
+        ParticlesClassRhs* targetsRhs;
+        long int nbTargetParticles;
+        long int arrayIndexSrc;
+    };
+
+    // P2P Inner Args
+    template <class LeafSymbolicData, class ParticlesClassValues, class ParticlesClassRhs>
+    struct P2PInnerArgs {
+        FRotationKernel<RealType_T, P, SpaceIndexType_T>* kernel;
+        LeafSymbolicData leafIndex;
+        long int particlesIndexes[1];  // Dynamic size in reality
+        ParticlesClassValues* particles;
+        ParticlesClassRhs* particlesRhs;
+        long int nbParticles;
+    };
+};
+
+
+
 
 /**
  * @author Berenger Bramas (berenger.bramas@inria.fr)
@@ -63,6 +171,10 @@ private:
   const RealType PI2 = RealType(
       3.14159265358979323846264338327950288419716939937510582097494459230781640628620899863L *
       2.0);
+  int mpi_rank;
+  int mpi_size;
+  starpu_mpi_tag_t next_tag;
+  MPI_Comm mpi_comm;
 
   //< Size of the data array computed using a suite relation
   static const int SizeArray = ((P + 2) * (P + 1)) / 2;
@@ -1023,27 +1135,920 @@ public:
         treeHeight(int(inConfiguration.getTreeHeight())),
         widthAtLeafLevel(inConfiguration.getLeafWidths()[0]),
         widthAtLeafLevelDiv2(widthAtLeafLevel / 2),
-        boxCorner(inConfiguration.getBoxCorner()) {
-    // simply does the precomputation
-    precomputeFactorials();
-    precomputeTranslationCoef();
-    precomputeRotationVectors();
+        boxCorner(inConfiguration.getBoxCorner()),
+        mpi_comm(comm),
+        next_tag(0) {
+          // Initialize MPI rank and size
+        MPI_Comm_rank(mpi_comm, &mpi_rank);
+        MPI_Comm_size(mpi_comm, &mpi_size);
+
+      // simply does the precomputation
+      precomputeFactorials();
+      precomputeTranslationCoef();
+      precomputeRotationVectors();
   }
 
-  /** Copy Constructor */
-  FRotationKernel(const FRotationKernel &other)
-      : spaceIndexSystem(other.spaceIndexSystem), boxWidth(other.boxWidth),
-        treeHeight(other.treeHeight), widthAtLeafLevel(other.widthAtLeafLevel),
-        widthAtLeafLevelDiv2(other.widthAtLeafLevelDiv2),
-        boxCorner(other.boxCorner) {
-    // simply does the precomputation
-    precomputeFactorials();
-    precomputeTranslationCoef();
-    precomputeRotationVectors();
-  }
+    // Add getter for MPI rank
+    int getMpiRank() const { return mpi_rank; }
+    
+    // Add getter for MPI size
+    int getMpiSize() const { return mpi_size; }
+    
+    // Add tag generator for MPI communications
+    starpu_mpi_tag_t getNewTag() { return next_tag++; }
+  
+    // Add cell ownership functions
+    bool isCellOwnedByThisRank(const CellSymbolicData &cellData) const {
+        // Simple round-robin distribution by Morton index
+        return (cellData.mortonIndex % mpi_size) == mpi_rank;
+    }
 
-  /** Default destructor */
-  virtual ~FRotationKernel() = default;
+    int getCellOwnerRank(const CellSymbolicData &cellData) const {
+        // Simple round-robin distribution by Morton index
+        return cellData.mortonIndex % mpi_size;
+    }
+
+    template <class CellSymbolicData, class ParticlesClass, class LeafClass>
+    void registerP2MTask(starpu_mpi_tag_t tag,
+                        const CellSymbolicData &leafIndex,
+                        const long int particlesIndexes[],
+                        const ParticlesClass &sourceParticles,
+                        const unsigned long long nbParticles,
+                        LeafClass &leafCell) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_p2m";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template P2MArgs<CellSymbolicData, ParticlesClass, LeafClass>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                LeafClass* leafCell = (LeafClass*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                
+                kernel->P2M(args->leafIndex, args->particlesIndexes, 
+                           args->sourceParticles, args->nbParticles, 
+                           *leafCell);
+            };
+            cl.nbuffers = 1;
+            cl.modes[0] = STARPU_RW;  // LeafCell is read/write
+            
+            #ifdef __NVCC__
+            if constexpr (CudaP2P) {
+                cl.cuda_funcs[0] = your_p2m_cuda_function;
+            }
+            #endif
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template P2MArgs<CellSymbolicData, ParticlesClass, LeafClass>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->leafIndex = leafIndex;
+        // Copy particlesIndexes if needed
+        args->sourceParticles = sourceParticles;
+        args->nbParticles = nbParticles;
+        args->leafCell = &leafCell;
+        
+        // Get owner rank for this cell
+        int owner_rank = getCellOwnerRank(leafIndex);
+        
+        // Register data with StarPU MPI
+        starpu_data_handle_t leafCellHandle;
+        void* leafCellPtr = (void*)&leafCell;
+        starpu_variable_data_register(&leafCellHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)leafCellPtr, sizeof(LeafClass));
+        starpu_mpi_data_register(leafCellHandle, tag, owner_rank);
+        
+        // Insert the task
+        starpu_mpi_task_insert(mpi_comm, &cl,
+                              STARPU_RW, leafCellHandle,
+                              STARPU_VALUE, args, sizeof(*args),
+                              STARPU_PRIORITY, getPriorityForLevel(treeHeight - 1),  // Leaf level has highest priority
+                              0);
+        
+        // Unregister the handle (StarPU MPI will handle it)
+        starpu_data_unregister_submit(leafCellHandle);
+    }
+
+    template <class CellSymbolicData, class CellClassContainer, class CellClass>
+    void registerM2MTask(starpu_mpi_tag_t parentTag,
+                        starpu_mpi_tag_t childrenTags[],
+                        const CellSymbolicData &parentIndex,
+                        const long int level,
+                        CellClassContainer &lowerCells,
+                        CellClass &upperCell,
+                        const long int childrenPos[],
+                        const long int nbChildren) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_m2m";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template M2MArgs<CellSymbolicData, CellClassContainer, CellClass>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                CellClass* upperCell = (CellClass*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                
+                // Get pointers to all children
+                CellClassContainer lowerCells;
+                for (int i = 0; i < args->nbChildren; i++) {
+                    lowerCells[i].set((std::complex<RealType>*)STARPU_VARIABLE_GET_PTR(buffers[i+1]));
+                }
+                
+                kernel->M2M(args->parentIndex, args->level, lowerCells, 
+                           *upperCell, args->childrenPos, args->nbChildren);
+            };
+            cl.nbuffers = STARPU_VARIABLE_NBUFFERS;  // Variable number of buffers
+            cl.modes[0] = STARPU_RW;  // Parent cell is read/write
+            for (int i = 1; i < STARPU_NMAXBUFS; i++) {
+                cl.modes[i] = STARPU_R;  // Child cells are read-only
+            }
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template M2MArgs<CellSymbolicData, CellClassContainer, CellClass>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->parentIndex = parentIndex;
+        args->level = level;
+        args->lowerCells = &lowerCells;
+        args->upperCell = &upperCell;
+        memcpy(args->childrenPos, childrenPos, nbChildren * sizeof(long int));
+        args->nbChildren = nbChildren;
+        
+        // Get owner rank for parent cell
+        int parentRank = getCellOwnerRank(parentIndex);
+        
+        // Register data with StarPU MPI
+        starpu_data_handle_t parentHandle;
+        void* parentPtr = (void*)&upperCell;
+        starpu_variable_data_register(&parentHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)parentPtr, sizeof(CellClass));
+        starpu_mpi_data_register(parentHandle, parentTag, parentRank);
+        
+        // Register children data
+        starpu_data_handle_t childrenHandles[nbChildren];
+        for (int i = 0; i < nbChildren; i++) {
+            void* childPtr = (void*)lowerCells[i].get();
+            starpu_variable_data_register(&childrenHandles[i], STARPU_MAIN_RAM, 
+                                         (uintptr_t)childPtr, sizeof(CellClass));
+            
+            // Get owner rank for child cell
+            int childRank = getCellOwnerRank(childrenPos[i]);
+            starpu_mpi_data_register(childrenHandles[i], childrenTags[i], childRank);
+        }
+        
+        // Insert the task
+        starpu_mpi_task_insert(mpi_comm, &cl,
+                              STARPU_RW, parentHandle,
+                              STARPU_R_ARRAY, childrenHandles, nbChildren,
+                              STARPU_VALUE, args, sizeof(*args),
+                              STARPU_PRIORITY, getPriorityForLevel(level),
+                              0);
+        
+        // Unregister handles
+        starpu_data_unregister_submit(parentHandle);
+        for (int i = 0; i < nbChildren; i++) {
+            starpu_data_unregister_submit(childrenHandles[i]);
+        }
+    }
+
+    template <class CellSymbolicData, class CellClassContainer, class CellClass>
+    void registerM2LTask(starpu_mpi_tag_t targetTag,
+                        starpu_mpi_tag_t interactionTags[],
+                        const CellSymbolicData &targetIndex,
+                        const long int level,
+                        const CellClassContainer &interactingCells,
+                        const long int neighPos[],
+                        const long int nbNeighbors,
+                        CellClass &outCell) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_m2l";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template M2LArgs<CellSymbolicData, CellClassContainer, CellClass>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                CellClass* outCell = (CellClass*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                
+                // Get pointers to all interacting cells
+                CellClassContainer interactingCells;
+                for (int i = 0; i < args->nbNeighbors; i++) {
+                    interactingCells[i].set((std::complex<RealType>*)STARPU_VARIABLE_GET_PTR(buffers[i+1]));
+                }
+                
+                kernel->M2L(args->targetIndex, args->level, interactingCells, 
+                           args->neighPos, args->nbNeighbors, *outCell);
+            };
+            cl.nbuffers = STARPU_VARIABLE_NBUFFERS;  // Variable number of buffers
+            cl.modes[0] = STARPU_RW;  // Target cell is read/write
+            for (int i = 1; i < STARPU_NMAXBUFS; i++) {
+                cl.modes[i] = STARPU_R;  // Interacting cells are read-only
+            }
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template M2LArgs<CellSymbolicData, CellClassContainer, CellClass>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->targetIndex = targetIndex;
+        args->level = level;
+        args->interactingCells = &interactingCells;
+        memcpy(args->neighPos, neighPos, nbNeighbors * sizeof(long int));
+        args->nbNeighbors = nbNeighbors;
+        args->outCell = &outCell;
+        
+        // Get owner rank for target cell
+        int targetRank = getCellOwnerRank(targetIndex);
+        
+        // Register target data
+        starpu_data_handle_t targetHandle;
+        void* targetPtr = (void*)&outCell;
+        starpu_variable_data_register(&targetHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)targetPtr, sizeof(CellClass));
+        starpu_mpi_data_register(targetHandle, targetTag, targetRank);
+        
+        // Register interaction data
+        starpu_data_handle_t interactionHandles[nbNeighbors];
+        for (int i = 0; i < nbNeighbors; i++) {
+            void* interactionPtr = (void*)interactingCells[i].get();
+            starpu_variable_data_register(&interactionHandles[i], STARPU_MAIN_RAM, 
+                                         (uintptr_t)interactionPtr, sizeof(CellClass));
+            
+            int interactionRank = getCellOwnerRank(neighPos[i]);
+            starpu_mpi_data_register(interactionHandles[i], interactionTags[i], interactionRank);
+        }
+        
+        // Insert the task
+        starpu_mpi_task_insert(mpi_comm, &cl,
+                              STARPU_RW, targetHandle,
+                              STARPU_R_ARRAY, interactionHandles, nbNeighbors,
+                              STARPU_VALUE, args, sizeof(*args),
+                              STARPU_PRIORITY, getPriorityForLevel(level),
+                              0);
+        
+        // Unregister handles
+        starpu_data_unregister_submit(targetHandle);
+        for (int i = 0; i < nbNeighbors; i++) {
+            starpu_data_unregister_submit(interactionHandles[i]);
+        }
+    }
+
+    template <class CellSymbolicData, class CellClass, class CellClassContainer>
+    void registerL2LTask(starpu_mpi_tag_t parentTag,
+                        starpu_mpi_tag_t childrenTags[],
+                        const CellSymbolicData &parentIndex,
+                        const long int level,
+                        const CellClass &upperCell,
+                        CellClassContainer &lowerCells,
+                        const long int childrenPos[],
+                        const long int nbChildren) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_l2l";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template L2LArgs<CellSymbolicData, CellClass, CellClassContainer>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                CellClass* upperCell = (CellClass*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                
+                // Get pointers to all children
+                CellClassContainer lowerCells;
+                for (int i = 0; i < args->nbChildren; i++) {
+                    lowerCells[i].set((std::complex<RealType>*)STARPU_VARIABLE_GET_PTR(buffers[i+1]));
+                }
+                
+                kernel->L2L(args->parentIndex, args->level, *upperCell,
+                           lowerCells, args->childrenPos, args->nbChildren);
+            };
+            cl.nbuffers = STARPU_VARIABLE_NBUFFERS;
+            cl.modes[0] = STARPU_R;  // Parent cell is read-only
+            for (int i = 1; i < STARPU_NMAXBUFS; i++) {
+                cl.modes[i] = STARPU_RW;  // Child cells are read-write
+            }
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template L2LArgs<CellSymbolicData, CellClass, CellClassContainer>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->parentIndex = parentIndex;
+        args->level = level;
+        args->upperCell = &upperCell;
+        args->lowerCells = &lowerCells;
+        memcpy(args->childrenPos, childrenPos, nbChildren * sizeof(long int));
+        args->nbChildren = nbChildren;
+        
+        // Get owner rank for parent cell
+        int parentRank = getCellOwnerRank(parentIndex);
+        
+        // Register parent data
+        starpu_data_handle_t parentHandle;
+        void* parentPtr = (void*)&upperCell;
+        starpu_variable_data_register(&parentHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)parentPtr, sizeof(CellClass));
+        starpu_mpi_data_register(parentHandle, parentTag, parentRank);
+        
+        // Register children data
+        starpu_data_handle_t childrenHandles[nbChildren];
+        for (int i = 0; i < nbChildren; i++) {
+            void* childPtr = (void*)lowerCells[i].get();
+            starpu_variable_data_register(&childrenHandles[i], STARPU_MAIN_RAM, 
+                                         (uintptr_t)childPtr, sizeof(CellClass));
+            
+            int childRank = getCellOwnerRank(childrenPos[i]);
+            starpu_mpi_data_register(childrenHandles[i], childrenTags[i], childRank);
+        }
+        
+        // Insert the task
+        starpu_mpi_task_insert(mpi_comm, &cl,
+                              STARPU_R, parentHandle,
+                              STARPU_RW_ARRAY, childrenHandles, nbChildren,
+                              STARPU_VALUE, args, sizeof(*args),
+                              STARPU_PRIORITY, getPriorityForLevel(level),
+                              0);
+        
+        // Unregister handles
+        starpu_data_unregister_submit(parentHandle);
+        for (int i = 0; i < nbChildren; i++) {
+            starpu_data_unregister_submit(childrenHandles[i]);
+        }
+    }
+
+    template <class CellSymbolicData, class LeafClass, class ParticlesClass, class ParticlesClassRhs>
+    void registerL2PTask(starpu_mpi_tag_t leafTag,
+                         starpu_mpi_tag_t particlesTag,
+                         starpu_mpi_tag_t particlesRhsTag,
+                         const CellSymbolicData &leafIndex,
+                         const LeafClass &leafCell,
+                         const long int particlesIndexes[],
+                         ParticlesClass &particles,
+                         ParticlesClassRhs &particlesRhs,
+                         const long int nbParticles) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_l2p";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template L2PArgs<CellSymbolicData, LeafClass, ParticlesClass, ParticlesClassRhs>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                LeafClass* leafCell = (LeafClass*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                ParticlesClass* particles = (ParticlesClass*)STARPU_VARIABLE_GET_PTR(buffers[1]);
+                ParticlesClassRhs* particlesRhs = (ParticlesClassRhs*)STARPU_VARIABLE_GET_PTR(buffers[2]);
+                
+                kernel->L2P(args->leafIndex, *leafCell, args->particlesIndexes,
+                            *particles, *particlesRhs, args->nbParticles);
+            };
+            cl.nbuffers = 3;
+            cl.modes[0] = STARPU_R;    // LeafCell is read-only
+            cl.modes[1] = STARPU_R;    // Particles positions are read-only
+            cl.modes[2] = STARPU_RW;   // ParticlesRhs (forces/potentials) are read-write
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template L2PArgs<CellSymbolicData, LeafClass, ParticlesClass, ParticlesClassRhs>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->leafIndex = leafIndex;
+        args->leafCell = &leafCell;
+        // Copy particlesIndexes if needed
+        args->particles = &particles;
+        args->particlesRhs = &particlesRhs;
+        args->nbParticles = nbParticles;
+        
+        // Get owner ranks
+        int leafRank = getCellOwnerRank(leafIndex);
+        int particlesRank = leafRank;  // Usually particles are on the same rank as the leaf
+        
+        // Register data
+        starpu_data_handle_t leafHandle;
+        void* leafPtr = (void*)&leafCell;
+        starpu_variable_data_register(&leafHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)leafPtr, sizeof(LeafClass));
+        starpu_mpi_data_register(leafHandle, leafTag, leafRank);
+        
+        starpu_data_handle_t particlesHandle;
+        void* particlesPtr = (void*)&particles;
+        size_t particlesSize = sizeof(RealType) * 4 * nbParticles;  // Approximate size
+        starpu_variable_data_register(&particlesHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)particlesPtr, particlesSize);
+        starpu_mpi_data_register(particlesHandle, particlesTag, particlesRank);
+        
+        starpu_data_handle_t rhsHandle;
+        void* rhsPtr = (void*)&particlesRhs;
+        size_t rhsSize = sizeof(RealType) * 4 * nbParticles;  // Approximate size
+        starpu_variable_data_register(&rhsHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)rhsPtr, rhsSize);
+        starpu_mpi_data_register(rhsHandle, particlesRhsTag, particlesRank);
+        
+        // Insert the task
+        starpu_mpi_task_insert(mpi_comm, &cl,
+                              STARPU_R, leafHandle,
+                              STARPU_R, particlesHandle,
+                              STARPU_RW, rhsHandle,
+                              STARPU_VALUE, args, sizeof(*args),
+                              STARPU_PRIORITY, getPriorityForLevel(treeHeight - 1),  // Leaf level
+                              0);
+        
+        // Unregister handles
+        starpu_data_unregister_submit(leafHandle);
+        starpu_data_unregister_submit(particlesHandle);
+        starpu_data_unregister_submit(rhsHandle);
+    }
+
+    template <class LeafSymbolicData, class ParticlesClassValues, class ParticlesClassRhs>
+    void registerP2PTask(starpu_mpi_tag_t neighParticlesTag,
+                         starpu_mpi_tag_t neighRhsTag,
+                         starpu_mpi_tag_t targetParticlesTag,
+                         starpu_mpi_tag_t targetRhsTag,
+                         const LeafSymbolicData &neighborIndex,
+                         const long int neighborsIndexes[],
+                         ParticlesClassValues &neighbors,
+                         ParticlesClassRhs &neighborsRhs,
+                         const long int nbParticlesNeighbors,
+                         const LeafSymbolicData &targetIndex,
+                         const long int targetIndexes[],
+                         ParticlesClassValues &targets,
+                         ParticlesClassRhs &targetsRhs,
+                         const long int nbTargetParticles,
+                         const long int arrayIndexSrc) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_p2p";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template P2PArgs<LeafSymbolicData, ParticlesClassValues, ParticlesClassRhs>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                ParticlesClassValues* neighbors = (ParticlesClassValues*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                ParticlesClassRhs* neighborsRhs = (ParticlesClassRhs*)STARPU_VARIABLE_GET_PTR(buffers[1]);
+                ParticlesClassValues* targets = (ParticlesClassValues*)STARPU_VARIABLE_GET_PTR(buffers[2]);
+                ParticlesClassRhs* targetsRhs = (ParticlesClassRhs*)STARPU_VARIABLE_GET_PTR(buffers[3]);
+                
+                kernel->P2P(args->neighborIndex, args->neighborsIndexes,
+                          *neighbors, *neighborsRhs, args->nbParticlesNeighbors,
+                          args->targetIndex, args->targetIndexes,
+                          *targets, *targetsRhs, args->nbTargetParticles,
+                          args->arrayIndexSrc);
+            };
+            cl.nbuffers = 4;
+            cl.modes[0] = STARPU_R;    // Neighbor particles are read-only
+            cl.modes[1] = STARPU_RW;   // Neighbor forces/potentials are read-write
+            cl.modes[2] = STARPU_R;    // Target particles are read-only
+            cl.modes[3] = STARPU_RW;   // Target forces/potentials are read-write
+            
+            #ifdef __NVCC__
+            if constexpr (CudaP2P) {
+                cl.cuda_funcs[0] = your_p2p_cuda_function;
+            }
+            #endif
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template P2PArgs<LeafSymbolicData, ParticlesClassValues, ParticlesClassRhs>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->neighborIndex = neighborIndex;
+        // Copy neighborsIndexes if needed
+        args->neighbors = &neighbors;
+        args->neighborsRhs = &neighborsRhs;
+        args->nbParticlesNeighbors = nbParticlesNeighbors;
+        args->targetIndex = targetIndex;
+        // Copy targetIndexes if needed
+        args->targets = &targets;
+        args->targetsRhs = &targetsRhs;
+        args->nbTargetParticles = nbTargetParticles;
+        args->arrayIndexSrc = arrayIndexSrc;
+        
+        // Get owner ranks
+        int neighRank = getCellOwnerRank(neighborIndex);
+        int targetRank = getCellOwnerRank(targetIndex);
+        
+        // Register data
+        starpu_
+
+    template <class LeafSymbolicData, class ParticlesClassValues, class ParticlesClassRhs>
+    void registerP2PTask(starpu_mpi_tag_t neighParticlesTag,
+                         starpu_mpi_tag_t neighRhsTag,
+                         starpu_mpi_tag_t targetParticlesTag,
+                         starpu_mpi_tag_t targetRhsTag,
+                         const LeafSymbolicData &neighborIndex,
+                         const long int neighborsIndexes[],
+                         ParticlesClassValues &neighbors,
+                         ParticlesClassRhs &neighborsRhs,
+                         const long int nbParticlesNeighbors,
+                         const LeafSymbolicData &targetIndex,
+                         const long int targetIndexes[],
+                         ParticlesClassValues &targets,
+                         ParticlesClassRhs &targetsRhs,
+                         const long int nbTargetParticles,
+                         const long int arrayIndexSrc) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_p2p";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template P2PArgs<LeafSymbolicData, ParticlesClassValues, ParticlesClassRhs>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                ParticlesClassValues* neighbors = (ParticlesClassValues*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                ParticlesClassRhs* neighborsRhs = (ParticlesClassRhs*)STARPU_VARIABLE_GET_PTR(buffers[1]);
+                ParticlesClassValues* targets = (ParticlesClassValues*)STARPU_VARIABLE_GET_PTR(buffers[2]);
+                ParticlesClassRhs* targetsRhs = (ParticlesClassRhs*)STARPU_VARIABLE_GET_PTR(buffers[3]);
+                
+                kernel->P2P(args->neighborIndex, args->neighborsIndexes,
+                          *neighbors, *neighborsRhs, args->nbParticlesNeighbors,
+                          args->targetIndex, args->targetIndexes,
+                          *targets, *targetsRhs, args->nbTargetParticles,
+                          args->arrayIndexSrc);
+            };
+            cl.nbuffers = 4;
+            cl.modes[0] = STARPU_R;    // Neighbor particles are read-only
+            cl.modes[1] = STARPU_RW;   // Neighbor forces/potentials are read-write
+            cl.modes[2] = STARPU_R;    // Target particles are read-only
+            cl.modes[3] = STARPU_RW;   // Target forces/potentials are read-write
+            
+            #ifdef __NVCC__
+            if constexpr (CudaP2P) {
+                cl.cuda_funcs[0] = P2PTsmCuda;
+            }
+            #endif
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template P2PArgs<LeafSymbolicData, ParticlesClassValues, ParticlesClassRhs>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->neighborIndex = neighborIndex;
+        // Copy neighborsIndexes if needed
+        args->neighbors = &neighbors;
+        args->neighborsRhs = &neighborsRhs;
+        args->nbParticlesNeighbors = nbParticlesNeighbors;
+        args->targetIndex = targetIndex;
+        // Copy targetIndexes if needed
+        args->targets = &targets;
+        args->targetsRhs = &targetsRhs;
+        args->nbTargetParticles = nbTargetParticles;
+        args->arrayIndexSrc = arrayIndexSrc;
+        
+        // Get owner ranks
+        int neighRank = getCellOwnerRank(neighborIndex);
+        int targetRank = getCellOwnerRank(targetIndex);
+        
+        // Register data handles
+        starpu_data_handle_t neighParticlesHandle;
+        void* neighParticlesPtr = (void*)&neighbors;
+        size_t neighParticlesSize = sizeof(RealType) * 4 * nbParticlesNeighbors;  // Approximate size
+        starpu_variable_data_register(&neighParticlesHandle, STARPU_MAIN_RAM, 
+                                      (uintptr_t)neighParticlesPtr, neighParticlesSize);
+        starpu_mpi_data_register(neighParticlesHandle, neighParticlesTag, neighRank);
+        
+        starpu_data_handle_t neighRhsHandle;
+        void* neighRhsPtr = (void*)&neighborsRhs;
+        size_t neighRhsSize = sizeof(RealType) * 4 * nbParticlesNeighbors;  // Approximate size
+        starpu_variable_data_register(&neighRhsHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)neighRhsPtr, neighRhsSize);
+        starpu_mpi_data_register(neighRhsHandle, neighRhsTag, neighRank);
+        
+        starpu_data_handle_t targetParticlesHandle;
+        void* targetParticlesPtr = (void*)&targets;
+        size_t targetParticlesSize = sizeof(RealType) * 4 * nbTargetParticles;  // Approximate size
+        starpu_variable_data_register(&targetParticlesHandle, STARPU_MAIN_RAM, 
+                                      (uintptr_t)targetParticlesPtr, targetParticlesSize);
+        starpu_mpi_data_register(targetParticlesHandle, targetParticlesTag, targetRank);
+        
+        starpu_data_handle_t targetRhsHandle;
+        void* targetRhsPtr = (void*)&targetsRhs;
+        size_t targetRhsSize = sizeof(RealType) * 4 * nbTargetParticles;  // Approximate size
+        starpu_variable_data_register(&targetRhsHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)targetRhsPtr, targetRhsSize);
+        starpu_mpi_data_register(targetRhsHandle, targetRhsTag, targetRank);
+        
+        // Insert the task
+        starpu_mpi_task_insert(mpi_comm, &cl,
+                              STARPU_R, neighParticlesHandle,
+                              STARPU_RW, neighRhsHandle,
+                              STARPU_R, targetParticlesHandle,
+                              STARPU_RW, targetRhsHandle,
+                              STARPU_VALUE, args, sizeof(*args),
+                              STARPU_PRIORITY, getPriorityForLevel(treeHeight - 1),  // Leaf level
+                              0);
+        
+        // Unregister handles
+        starpu_data_unregister_submit(neighParticlesHandle);
+        starpu_data_unregister_submit(neighRhsHandle);
+        starpu_data_unregister_submit(targetParticlesHandle);
+        starpu_data_unregister_submit(targetRhsHandle);
+    }
+
+    template <class LeafSymbolicDataSource, class ParticlesClassValuesSource,
+              class LeafSymbolicDataTarget, class ParticlesClassValuesTarget,
+              class ParticlesClassRhs>
+    void registerP2PTsmTask(starpu_mpi_tag_t sourceParticlesTag,
+                           starpu_mpi_tag_t targetParticlesTag,
+                           starpu_mpi_tag_t targetRhsTag,
+                           const LeafSymbolicDataSource &sourceIndex,
+                           const long int sourceIndexes[],
+                           const ParticlesClassValuesSource &sources,
+                           const long int nbSourceParticles,
+                           const LeafSymbolicDataTarget &targetIndex,
+                           const long int targetIndexes[],
+                           const ParticlesClassValuesTarget &targets,
+                           ParticlesClassRhs &targetsRhs,
+                           const long int nbTargetParticles,
+                           const long int arrayIndexSrc) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_p2p_tsm";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template P2PTsmArgs<LeafSymbolicDataSource, ParticlesClassValuesSource,
+                                        LeafSymbolicDataTarget, ParticlesClassValuesTarget,
+                                        ParticlesClassRhs>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                ParticlesClassValuesSource* sources = (ParticlesClassValuesSource*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                ParticlesClassValuesTarget* targets = (ParticlesClassValuesTarget*)STARPU_VARIABLE_GET_PTR(buffers[1]);
+                ParticlesClassRhs* targetsRhs = (ParticlesClassRhs*)STARPU_VARIABLE_GET_PTR(buffers[2]);
+                
+                kernel->P2PTsm(args->sourceIndex, args->sourceIndexes,
+                              *sources, args->nbSourceParticles,
+                              args->targetIndex, args->targetIndexes,
+                              *targets, *targetsRhs, args->nbTargetParticles,
+                              args->arrayIndexSrc);
+            };
+            cl.nbuffers = 3;
+            cl.modes[0] = STARPU_R;    // Source particles are read-only
+            cl.modes[1] = STARPU_R;    // Target particles are read-only
+            cl.modes[2] = STARPU_RW;   // Target forces/potentials are read-write
+            
+            #ifdef __NVCC__
+            if constexpr (CudaP2P) {
+                cl.cuda_funcs[0] = P2PTsmCuda;
+            }
+            #endif
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template P2PTsmArgs<LeafSymbolicDataSource, ParticlesClassValuesSource,
+                                LeafSymbolicDataTarget, ParticlesClassValuesTarget,
+                                ParticlesClassRhs>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->sourceIndex = sourceIndex;
+        // Copy sourceIndexes if needed
+        args->sources = &sources;
+        args->nbSourceParticles = nbSourceParticles;
+        args->targetIndex = targetIndex;
+        // Copy targetIndexes if needed
+        args->targets = &targets;
+        args->targetsRhs = &targetsRhs;
+        args->nbTargetParticles = nbTargetParticles;
+        args->arrayIndexSrc = arrayIndexSrc;
+        
+        // Get owner ranks
+        int sourceRank = getCellOwnerRank(sourceIndex);
+        int targetRank = getCellOwnerRank(targetIndex);
+        
+        // Register data handles
+        starpu_data_handle_t sourceParticlesHandle;
+        void* sourceParticlesPtr = (void*)&sources;
+        size_t sourceParticlesSize = sizeof(RealType) * 4 * nbSourceParticles;  // Approximate size
+        starpu_variable_data_register(&sourceParticlesHandle, STARPU_MAIN_RAM, 
+                                      (uintptr_t)sourceParticlesPtr, sourceParticlesSize);
+        starpu_mpi_data_register(sourceParticlesHandle, sourceParticlesTag, sourceRank);
+        
+        starpu_data_handle_t targetParticlesHandle;
+        void* targetParticlesPtr = (void*)&targets;
+        size_t targetParticlesSize = sizeof(RealType) * 4 * nbTargetParticles;  // Approximate size
+        starpu_variable_data_register(&targetParticlesHandle, STARPU_MAIN_RAM, 
+                                      (uintptr_t)targetParticlesPtr, targetParticlesSize);
+        starpu_mpi_data_register(targetParticlesHandle, targetParticlesTag, targetRank);
+        
+        starpu_data_handle_t targetRhsHandle;
+        void* targetRhsPtr = (void*)&targetsRhs;
+        size_t targetRhsSize = sizeof(RealType) * 4 * nbTargetParticles;  // Approximate size
+        starpu_variable_data_register(&targetRhsHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)targetRhsPtr, targetRhsSize);
+        starpu_mpi_data_register(targetRhsHandle, targetRhsTag, targetRank);
+        
+        // Insert the task
+        starpu_mpi_task_insert(mpi_comm, &cl,
+                              STARPU_R, sourceParticlesHandle,
+                              STARPU_R, targetParticlesHandle,
+                              STARPU_RW, targetRhsHandle,
+                              STARPU_VALUE, args, sizeof(*args),
+                              STARPU_PRIORITY, getPriorityForLevel(treeHeight - 1),  // Leaf level
+                              0);
+        
+        // Unregister handles
+        starpu_data_unregister_submit(sourceParticlesHandle);
+        starpu_data_unregister_submit(targetParticlesHandle);
+        starpu_data_unregister_submit(targetRhsHandle);
+    }
+
+    template <class LeafSymbolicData, class ParticlesClassValues, class ParticlesClassRhs>
+    void registerP2PInnerTask(starpu_mpi_tag_t particlesTag,
+                             starpu_mpi_tag_t rhsTag,
+                             const LeafSymbolicData &leafIndex,
+                             const long int particlesIndexes[],
+                             ParticlesClassValues &particles,
+                             ParticlesClassRhs &particlesRhs,
+                             const long int nbParticles) {
+        // Define the codelet if not already defined
+        static starpu_codelet cl = {};
+        if (!cl.nbuffers) {
+            cl.name = "rotation_p2p_inner";
+            cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+                    template P2PInnerArgs<LeafSymbolicData, ParticlesClassValues, ParticlesClassRhs>;
+                
+                auto args = reinterpret_cast<ArgsType*>(cl_args);
+                auto kernel = args->kernel;
+                
+                ParticlesClassValues* particles = (ParticlesClassValues*)STARPU_VARIABLE_GET_PTR(buffers[0]);
+                ParticlesClassRhs* particlesRhs = (ParticlesClassRhs*)STARPU_VARIABLE_GET_PTR(buffers[1]);
+                
+                kernel->P2PInner(args->leafIndex, args->particlesIndexes,
+                               *particles, *particlesRhs, args->nbParticles);
+            };
+            cl.nbuffers = 2;
+            cl.modes[0] = STARPU_R;    // Particles are read-only
+            cl.modes[1] = STARPU_RW;   // Particles forces/potentials are read-write
+            
+            #ifdef __NVCC__
+            if constexpr (CudaP2P) {
+                cl.cuda_funcs[0] = P2PInnerCuda;
+            }
+            #endif
+        }
+        
+        // Create task args
+        using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+            template P2PInnerArgs<LeafSymbolicData, ParticlesClassValues, ParticlesClassRhs>;
+        
+        ArgsType* args = (ArgsType*)malloc(sizeof(ArgsType));
+        args->kernel = this;
+        args->leafIndex = leafIndex;
+        // Copy particlesIndexes if needed
+        args->particles = &particles;
+        args->particlesRhs = &particlesRhs;
+        args->nbParticles = nbParticles;
+        
+        // Get owner rank
+        int leafRank = getCellOwnerRank(leafIndex);
+        
+        // Register data handles
+        starpu_data_handle_t particlesHandle;
+        void* particlesPtr = (void*)&particles;
+        size_t particlesSize = sizeof(RealType) * 4 * nbParticles;  // Approximate size
+        starpu_variable_data_register(&particlesHandle, STARPU_MAIN_RAM, 
+                                      (uintptr_t)particlesPtr, particlesSize);
+        starpu_mpi_data_register(particlesHandle, particlesTag, leafRank);
+        
+        starpu_data_handle_t rhsHandle;
+        void* rhsPtr = (void*)&particlesRhs;
+        size_t rhsSize = sizeof(RealType) * 4 * nbParticles;  // Approximate size
+        starpu_variable_data_register(&rhsHandle, STARPU_MAIN_RAM, 
+                                     (uintptr_t)rhsPtr, rhsSize);
+        starpu_mpi_data_register(rhsHandle, rhsTag, leafRank);
+        
+        // Insert the task
+        starpu_mpi_task_insert(mpi_comm, &cl,
+                              STARPU_R, particlesHandle,
+                              STARPU_RW, rhsHandle,
+                              STARPU_VALUE, args, sizeof(*args),
+                              STARPU_PRIORITY, getPriorityForLevel(treeHeight - 1),  // Leaf level
+                              0);
+        
+        // Unregister handles
+        starpu_data_unregister_submit(particlesHandle);
+        starpu_data_unregister_submit(rhsHandle);
+    }
+
+
+      /** Copy Constructor */
+      FRotationKernel(const FRotationKernel &other)
+          : spaceIndexSystem(other.spaceIndexSystem), boxWidth(other.boxWidth),
+            treeHeight(other.treeHeight), widthAtLeafLevel(other.widthAtLeafLevel),
+            widthAtLeafLevelDiv2(other.widthAtLeafLevelDiv2),
+            boxCorner(other.boxCorner) {
+        // simply does the precomputation
+        precomputeFactorials();
+        precomputeTranslationCoef();
+        precomputeRotationVectors();
+      }
+
+      /** Default destructor */
+      virtual ~FRotationKernel() = default;
+
+      template <class CellSymbolicData, class CellClassContainer, class CellClass>
+      void registerM2MTask(starpu_mpi_data_handle_t parentHandle, starpu_mpi_data_handle_t childHandles[],
+                           const CellSymbolicData &inParentIndex, const long int inLevel,
+                           const int nbChildren, const long int childrenPos[]) {
+          // Define codelet for M2M
+          static starpu_codelet cl = {};
+          if (!cl.nbuffers) {
+              cl.name = "rotation_m2m";
+              cl.cpu_funcs[0] = [](void *buffers[], void *cl_args) {
+                  auto args = reinterpret_cast<M2MArgs<CellSymbolicData, CellClassContainer, CellClass>*>(cl_args);
+                  auto kernel = args->kernel;
+                  kernel->M2M(args->parentIndex, args->level, args->lowerCells, args->upperCell, 
+                               args->childrenPos, args->nbChildren);
+              };
+              cl.nbuffers = STARPU_VARIABLE_NBUFFERS;
+              cl.modes[0] = STARPU_RW;  // Parent cell
+              for (int i = 1; i < STARPU_NMAXBUFS; i++) {
+                  cl.modes[i] = STARPU_R;  // Child cells
+              }
+          }
+          
+          // Create task args
+          struct M2MArgs<CellSymbolicData, CellClassContainer, CellClass> *args = 
+              (struct M2MArgs<CellSymbolicData, CellClassContainer, CellClass>*)
+              malloc(sizeof(struct M2MArgs<CellSymbolicData, CellClassContainer, CellClass>));
+          args->kernel = this;
+          args->parentIndex = inParentIndex;
+          args->level = inLevel;
+          args->nbChildren = nbChildren;
+          memcpy(args->childrenPos, childrenPos, nbChildren * sizeof(long int));
+          
+          // Initialize task
+          starpu_mpi_task_insert(mpi_comm, &cl,
+                                STARPU_RW, parentHandle,
+                                STARPU_R_ARRAY, childHandles, nbChildren,
+                                STARPU_VALUE, args, sizeof(*args),
+                                STARPU_PRIORITY, getPriorityForLevel(inLevel),
+                                0);
+      }
+
+
+    void initStarpuMasterSlave() {
+        // Register all kernel functions for master-slave mode
+        starpu_mpi_ms_register_kernel(STARPU_MS_P2M_FUNC, (void*)&P2MCallback, NULL);
+        starpu_mpi_ms_register_kernel(STARPU_MS_M2M_FUNC, (void*)&M2MCallback, NULL);
+        starpu_mpi_ms_register_kernel(STARPU_MS_M2L_FUNC, (void*)&M2LCallback, NULL);
+        starpu_mpi_ms_register_kernel(STARPU_MS_L2L_FUNC, (void*)&L2LCallback, NULL);
+        starpu_mpi_ms_register_kernel(STARPU_MS_L2P_FUNC, (void*)&L2PCallback, NULL);
+        starpu_mpi_ms_register_kernel(STARPU_MS_P2P_FUNC, (void*)&P2PCallback, NULL);
+        starpu_mpi_ms_register_kernel(STARPU_MS_P2P_TSM_FUNC, (void*)&P2PTsmCallback, NULL);
+        starpu_mpi_ms_register_kernel(STARPU_MS_P2P_INNER_FUNC, (void*)&P2PInnerCallback, NULL);
+        
+        // Start master-slave loop on worker nodes (non-master ranks)
+        if (mpi_rank != 0) {  // Assuming rank 0 is the master
+            starpu_mpi_ms_worker_init();
+        }
+    }
+
+    void finalizeStarpuMasterSlave() {
+        // For non-master ranks, shut down the worker loop
+        if (mpi_rank != 0) {  // Assuming rank 0 is the master
+            starpu_mpi_ms_worker_shutdown();
+        }
+    }
 
   /** P2M
    * The computation is based on the paper :
@@ -1648,5 +2653,104 @@ public:
   }
 #endif
 };
+
+// Callback functions for StarPU MPI Master-Slave mode
+template <class RealType_T, int P, class SpaceIndexType_T>
+template <class CellSymbolicData, class ParticlesClass, class LeafClass>
+void FRotationKernel<RealType_T, P, SpaceIndexType_T>::P2MCallback(void *arg, starpu_mpi_ms_message *message) {
+    using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+        template P2MArgs<CellSymbolicData, ParticlesClass, LeafClass>;
+    
+    ArgsType* args = reinterpret_cast<ArgsType*>(message->arg);
+    args->kernel->P2M(args->leafIndex, args->particlesIndexes, 
+                     args->sourceParticles, args->nbParticles, 
+                     *args->leafCell);
+}
+
+template <class RealType_T, int P, class SpaceIndexType_T>
+template <class CellSymbolicData, class CellClassContainer, class CellClass>
+void FRotationKernel<RealType_T, P, SpaceIndexType_T>::M2MCallback(void *arg, starpu_mpi_ms_message *message) {
+    using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+        template M2MArgs<CellSymbolicData, CellClassContainer, CellClass>;
+    
+    ArgsType* args = reinterpret_cast<ArgsType*>(message->arg);
+    args->kernel->M2M(args->parentIndex, args->level, *args->lowerCells, 
+                     *args->upperCell, args->childrenPos, args->nbChildren);
+}
+
+template <class RealType_T, int P, class SpaceIndexType_T>
+template <class CellSymbolicData, class CellClassContainer, class CellClass>
+void FRotationKernel<RealType_T, P, SpaceIndexType_T>::M2LCallback(void *arg, starpu_mpi_ms_message *message) {
+    using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+        template M2LArgs<CellSymbolicData, CellClassContainer, CellClass>;
+    
+    ArgsType* args = reinterpret_cast<ArgsType*>(message->arg);
+    args->kernel->M2L(args->targetIndex, args->level, *args->interactingCells, 
+                     args->neighPos, args->nbNeighbors, *args->outCell);
+}
+
+template <class RealType_T, int P, class SpaceIndexType_T>
+template <class CellSymbolicData, class CellClass, class CellClassContainer>
+void FRotationKernel<RealType_T, P, SpaceIndexType_T>::L2LCallback(void *arg, starpu_mpi_ms_message *message) {
+    using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+        template L2LArgs<CellSymbolicData, CellClass, CellClassContainer>;
+    
+    ArgsType* args = reinterpret_cast<ArgsType*>(message->arg);
+    args->kernel->L2L(args->parentIndex, args->level, *args->upperCell,
+                     *args->lowerCells, args->childrenPos, args->nbChildren);
+}
+
+template <class RealType_T, int P, class SpaceIndexType_T>
+template <class CellSymbolicData, class LeafClass, class ParticlesClass, class ParticlesClassRhs>
+void FRotationKernel<RealType_T, P, SpaceIndexType_T>::L2PCallback(void *arg, starpu_mpi_ms_message *message) {
+    using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+        template L2PArgs<CellSymbolicData, LeafClass, ParticlesClass, ParticlesClassRhs>;
+    
+    ArgsType* args = reinterpret_cast<ArgsType*>(message->arg);
+    args->kernel->L2P(args->leafIndex, *args->leafCell, args->particlesIndexes,
+                     *args->particles, *args->particlesRhs, args->nbParticles);
+}
+
+template <class RealType_T, int P, class SpaceIndexType_T>
+template <class LeafSymbolicData, class ParticlesClassValues, class ParticlesClassRhs>
+void FRotationKernel<RealType_T, P, SpaceIndexType_T>::P2PCallback(void *arg, starpu_mpi_ms_message *message) {
+    using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+        template P2PArgs<LeafSymbolicData, ParticlesClassValues, ParticlesClassRhs>;
+    
+    ArgsType* args = reinterpret_cast<ArgsType*>(message->arg);
+    args->kernel->P2P(args->neighborIndex, args->neighborsIndexes,
+                    *args->neighbors, *args->neighborsRhs, args->nbParticlesNeighbors,
+                    args->targetIndex, args->targetIndexes,
+                    *args->targets, *args->targetsRhs, args->nbTargetParticles,
+                    args->arrayIndexSrc);
+}
+
+template <class RealType_T, int P, class SpaceIndexType_T>
+template <class LeafSymbolicDataSource, class ParticlesClassValuesSource,
+          class LeafSymbolicDataTarget, class ParticlesClassValuesTarget, class ParticlesClassRhs>
+void FRotationKernel<RealType_T, P, SpaceIndexType_T>::P2PTsmCallback(void *arg, starpu_mpi_ms_message *message) {
+    using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+        template P2PTsmArgs<LeafSymbolicDataSource, ParticlesClassValuesSource,
+                            LeafSymbolicDataTarget, ParticlesClassValuesTarget, ParticlesClassRhs>;
+    
+    ArgsType* args = reinterpret_cast<ArgsType*>(message->arg);
+    args->kernel->P2PTsm(args->sourceIndex, args->sourceIndexes,
+                        *args->sources, args->nbSourceParticles,
+                        args->targetIndex, args->targetIndexes,
+                        *args->targets, *args->targetsRhs, args->nbTargetParticles,
+                        args->arrayIndexSrc);
+}
+
+template <class RealType_T, int P, class SpaceIndexType_T>
+template <class LeafSymbolicData, class ParticlesClassValues, class ParticlesClassRhs>
+void FRotationKernel<RealType_T, P, SpaceIndexType_T>::P2PInnerCallback(void *arg, starpu_mpi_ms_message *message) {
+    using ArgsType = typename FRotationKernelArgs<RealType_T, P, SpaceIndexType_T>::
+        template P2PInnerArgs<LeafSymbolicData, ParticlesClassValues, ParticlesClassRhs>;
+    
+    ArgsType* args = reinterpret_cast<ArgsType*>(message->arg);
+    args->kernel->P2PInner(args->leafIndex, args->particlesIndexes,
+                         *args->particles, *args->particlesRhs, args->nbParticles);
+}
+
 
 #endif // FROTATIONKERNEL_HPP
