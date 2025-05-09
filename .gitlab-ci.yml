@@ -1,0 +1,109 @@
+image: berenger/tbfmmci
+
+stages:
+  - nomodules
+  - release
+  - coverage
+  - deploy
+
+tbfmm-gcc-no-modules:
+  tags:
+    - medium
+  script:
+    - g++-7 --version
+    - cmake --version
+    - mkdir build
+    - cd build
+    - CXX=g++-7 cmake -DBUILD_TESTS=ON ..
+    - make -j 2
+    - CTEST_OUTPUT_ON_FAILURE=TRUE OMP_PROC_BIND=FALSE OMP_NUM_THREADS=3 make test
+  stage: nomodules
+
+
+tbfmm-clang-no-modules:
+  tags:
+    - medium
+  script:
+    - clang++-8 --version
+    - cmake --version
+    - mkdir build
+    - cd build
+    - CXX=clang++-8 cmake -DBUILD_TESTS=ON ..
+    - make -j 2
+    - CTEST_OUTPUT_ON_FAILURE=TRUE OMP_PROC_BIND=FALSE OMP_NUM_THREADS=3 make test
+  stage: nomodules
+
+tbfmm-gcc-inastemp-spetabaru:
+  tags:
+    - large
+  script:
+    - g++-8 --version
+    - cmake --version
+    - git submodule init
+    - git submodule update
+    - mkdir build
+    - cd build
+    - CXX=g++-8 cmake -DBUILD_TESTS=ON ..
+    - make -j 2
+    - CTEST_OUTPUT_ON_FAILURE=TRUE OMP_PROC_BIND=FALSE OMP_NUM_THREADS=3 make test
+  stage: release
+   
+
+tbfmm-clang-inastemp-spetabaru:
+  tags:
+    - large
+  script:
+    - clang++-8 --version
+    - cmake --version
+    - git submodule init
+    - git submodule update
+    - mkdir build
+    - cd build
+    - CXX=clang++-8 cmake -DBUILD_TESTS=ON ..
+    - make -j 2
+    - CTEST_OUTPUT_ON_FAILURE=TRUE OMP_PROC_BIND=FALSE OMP_NUM_THREADS=3 make test
+  stage: release
+
+tbfmm-full-coverage:
+  tags:
+    - large
+  script:
+    - cd ..
+    - git clone https://github.com/linux-test-project/lcov.git
+    - cd lcov
+    - git checkout v1.14
+    - make install
+    - cd ../tbfmm/
+    - g++-8 --version
+    - cmake --version
+    - git submodule init
+    - git submodule update
+    - mkdir build
+    - cd build
+    - CXX=g++-8 cmake -DCMAKE_BUILD_TYPE=Debug -DUSE_COVERAGE=ON -DBUILD_TESTS=ON ..
+    - make -j 2
+    - CTEST_OUTPUT_ON_FAILURE=TRUE OMP_PROC_BIND=FALSE OMP_NUM_THREADS=3 make test
+    - /usr/local/bin/lcov --gcov-tool /usr/bin/gcov-8 --directory ./ -c -o coverage-rapport.info
+    - /usr/local/bin/lcov --gcov-tool /usr/bin/gcov-8 --list coverage-rapport.info
+    - /usr/local/bin/genhtml -o ../coverage -t "Coverage example" coverage-rapport.info
+  artifacts:
+    paths:
+      - coverage/
+  stage: coverage
+  only:
+    - master
+  timeout: 3 hours
+
+pages:
+  stage: deploy
+  dependencies:
+    - tbfmm-full-coverage
+  script:
+    - mv coverage/ public/
+  artifacts:
+    paths:
+      - public
+    expire_in: 30 days
+  only:
+    - master
+

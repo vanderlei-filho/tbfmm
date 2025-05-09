@@ -1,0 +1,8 @@
+[submodule "deps/specx"]
+	path = deps/specx
+	url = https://gitlab.inria.fr/bramas/specx.git
+	branch = master
+[submodule "deps/inastemp"]
+	path = deps/inastemp
+	url = https://gitlab.inria.fr/bramas/inastemp.git
+	branch = master

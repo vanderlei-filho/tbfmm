@@ -1,0 +1,8 @@
+CompileFlags:
+  Add: 
+    - "-I/opt/homebrew/include"
+    - "-I/usr/local/include"
+    - "-I/usr/local/include/starpu/1.4"
+    - "-I/opt/homebrew/Cellar/hwloc/2.12.0/include"
+    - "-DSTARPU_OPENCL_DATADIR=\"/usr/local/share/starpu/opencl\""
+    - "-DCL_USE_DEPRECATED_OPENCL_1_1_APIS"
